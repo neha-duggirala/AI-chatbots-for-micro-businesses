@@ -1,4 +1,4 @@
-"""LLM, retriever and LCEL chain construction (with conversation memory)."""
+"""LLM, retriever and LCEL chain construction (with conversation memory + guardrails)."""
 
 from pathlib import Path
 
@@ -7,15 +7,20 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables import Runnable, RunnableLambda, RunnablePassthrough
+from langchain_core.runnables import (
+    Runnable,
+    RunnableBranch,
+    RunnableLambda,
+    RunnablePassthrough,
+)
 from langchain_huggingface import ChatHuggingFace, HuggingFacePipeline
 from langchain_qdrant import QdrantVectorStore
 from transformers import pipeline
 from langchain_anthropic import ChatAnthropic
-from langchain_core.language_models import BaseChatModel
 
 from config import LLM_MAX_NEW_TOKENS, LLM_MODEL, LLM_TEMPERATURE, RETRIEVER_K
 from ingestion.reranker import rerank_docs
+from guardrails import AbhiMilkGuardrails  # <-- NEW (move the file wherever suits your project)
 
 # Number of past messages (user + assistant) sent to the model. 6 = last 3 turns.
 MAX_HISTORY_MESSAGES = 6
@@ -32,6 +37,9 @@ NO_ANSWER_REPLY = (
     "delivery and policies, but I couldn't find anything about that in our documents. "
     "Please try rephrasing, or ask me about our products or policies."
 )
+
+# Canned replies need no output check (saves one guardrail call).
+_CANNED_REPLIES = {NOT_FOUND_REPLY, NO_ANSWER_REPLY}
 
 # Small models follow concrete examples far better than abstract rules, so the
 # prompt is short, uses imperative rules, and includes two worked examples.
@@ -76,7 +84,6 @@ def build_llm() -> BaseChatModel:
     return ChatHuggingFace(llm=HuggingFacePipeline(pipeline=hf_pipeline))
 
 
-
 def build_claude_llm() -> BaseChatModel:
     """Anthropic Claude model wrapped as a chat model.
 
@@ -88,12 +95,20 @@ def build_claude_llm() -> BaseChatModel:
     )
 
 
-def build_retriever(stores: list[QdrantVectorStore], k: int = RETRIEVER_K) -> Runnable:
+def build_retriever(
+    stores: list[QdrantVectorStore],
+    k: int = RETRIEVER_K,
+    guard: AbhiMilkGuardrails | None = None,  # <-- NEW
+) -> Runnable:
     """Retrieve the top-k chunks across ALL given stores (not k per store).
 
     Each store returns its own top-k with similarity scores; the results are
     merged and the best k overall are kept. Scores are comparable because every
     collection uses the same embedding model and distance metric.
+
+    RETRIEVAL GUARDRAIL: when `guard` is given, chunks from blocked / non-allowed /
+    sensitive sources are dropped BEFORE the top-k cut, so they can never reach
+    the reranker, the prompt, or the user.
     """
 
     def retrieve(query: str) -> list[Document]:
@@ -102,6 +117,8 @@ def build_retriever(stores: list[QdrantVectorStore], k: int = RETRIEVER_K) -> Ru
             for store in stores
             for doc, score in store.similarity_search_with_score(query, k=k)
         ]
+        if guard is not None:  # <-- NEW
+            scored = [(d, s) for d, s in scored if guard.is_doc_allowed(d)[0]]
         top = sorted(scored, key=lambda pair: pair[1], reverse=True)[:k]
         for doc, score in top:
             doc.metadata["score"] = round(score, 4)
@@ -125,6 +142,7 @@ def _has_relevant_context(candidates: list[Document]) -> bool:
     """True if at least one retrieved chunk is similar enough to the question."""
     return any(doc.metadata.get("score", 0) >= MIN_SIMILARITY for doc in candidates)
 
+
 def _print_prompt(prompt_value):
     """Debug: print the exact messages sent to the LLM, then pass them through unchanged."""
     print("\n" + "=" * 80)
@@ -135,24 +153,29 @@ def _print_prompt(prompt_value):
     print("=" * 80 + "\n")
     return prompt_value
 
+
 def build_rag_chain(
     stores: list[QdrantVectorStore],
     llm: BaseChatModel | None = None,
+    guard: AbhiMilkGuardrails | None = None,  # <-- NEW (None = guardrails off)
 ) -> Runnable:
-    """Build a chain: condense question -> retrieve -> rerank -> answer.
+    """Build a chain: input guard -> condense -> retrieve -> rerank -> answer -> output guard.
 
     Input: a question string, or {"question": str, "history": [HumanMessage/AIMessage, ...]}
     where history holds the PREVIOUS turns (not the current question).
 
     Returns {"question", "history", "standalone_question", "candidates", "rerank",
-    "docs", "context", "answer"}. `standalone_question` is the history-aware rewrite
-    that retrieval and reranking actually used; `docs` are the reranked top-n chunks.
+    "docs", "context", "answer", "blocked_at", "violations"}.
+      - `blocked_at` is None, "input" or "output" (retrieval filtering drops chunks silently
+        and falls through to NO_ANSWER_REPLY if nothing is left).
+      - `violations` lists the guardrail checks that fired.
+      - If blocked at input, retrieval is skipped: `rerank` is None and `docs` is [].
     If no chunk reaches MIN_SIMILARITY, the LLM is skipped and `answer` is NO_ANSWER_REPLY.
 
     Pass an already-loaded `llm` to avoid reloading the model for every chain.
     """
     llm = llm or build_claude_llm()
-    retriever = build_retriever(stores)
+    retriever = build_retriever(stores, guard=guard)
 
     condense_chain = (
         ChatPromptTemplate.from_messages(
@@ -162,7 +185,7 @@ def build_rag_chain(
                 ("human", "{question}"),
             ]
         )
-        | RunnableLambda(_print_prompt) 
+        | RunnableLambda(_print_prompt)
         | llm
         | StrOutputParser()
     )
@@ -191,9 +214,48 @@ def build_rag_chain(
             return NO_ANSWER_REPLY
         return answer_chain.invoke(inputs).strip()
 
-    return (
-        RunnableLambda(_normalize_input)
-        | RunnablePassthrough.assign(standalone_question=RunnableLambda(condense))
+    # ------------------------------------------------------------------ #
+    # NEW: guardrail gates
+    # ------------------------------------------------------------------ #
+    def input_gate(inputs: dict) -> dict:
+        """Check the RAW question (before condense) so malicious text never reaches the LLM."""
+        if guard is None:
+            return {**inputs, "blocked_at": None, "violations": []}
+        res = guard.check_input(inputs["question"], history=inputs["history"])
+        if res.passed:
+            return {**inputs, "blocked_at": None, "violations": []}
+        return {
+            **inputs,
+            "blocked_at": "input",
+            "violations": res.violations,
+            "answer": res.message,
+        }
+
+    def blocked_result(x: dict) -> dict:
+        """Fill the keys downstream code expects when the input guard short-circuits."""
+        return {
+            **x,
+            "standalone_question": x["question"],
+            "candidates": [],
+            "rerank": None,
+            "docs": [],
+            "context": "",
+        }
+
+    def output_gate(x: dict) -> dict:
+        """Redact contact details / block PII leaks, hallucinations and brand-rule breaks."""
+        if guard is None or x["answer"] in _CANNED_REPLIES:
+            return x
+        res = guard.check_output(x["standalone_question"], x["answer"], x["docs"])
+        if not res.passed:
+            return {**x, "answer": res.message, "blocked_at": "output", "violations": res.violations}
+        return {**x, "answer": res.sanitized_text, "violations": res.violations}
+
+    # ------------------------------------------------------------------ #
+    # Main (unchanged) pipeline, plus the output gate at the end
+    # ------------------------------------------------------------------ #
+    main_chain = (
+        RunnablePassthrough.assign(standalone_question=RunnableLambda(condense))
         | RunnablePassthrough.assign(
             candidates=lambda x: retriever.invoke(x["standalone_question"])
         )
@@ -203,4 +265,14 @@ def build_rag_chain(
         | RunnablePassthrough.assign(docs=lambda x: x["rerank"].docs)
         | RunnablePassthrough.assign(context=lambda x: format_docs(x["docs"]))
         | RunnablePassthrough.assign(answer=RunnableLambda(answer))
+        | RunnableLambda(output_gate)
+    )
+
+    return (
+        RunnableLambda(_normalize_input)
+        | RunnableLambda(input_gate)
+        | RunnableBranch(
+            (lambda x: x["blocked_at"] is not None, RunnableLambda(blocked_result)),
+            main_chain,
+        )
     )

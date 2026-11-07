@@ -11,7 +11,8 @@ import streamlit as st
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
-from ingestion.plotting import plot_score_answer
+from guardrails import AbhiMilkGuardrails  # NEW
+from ingestion.plotting import plot_guardrail_stages, plot_score_answer  # CHANGED
 from ingestion.reranker import RerankResult
 from ingestion.vector_store import build_vector_stores
 from rag_chain import build_llm, build_rag_chain, build_claude_llm
@@ -29,13 +30,17 @@ def load_llm():
 
 
 def load_chain():
-    """RAG chain that searches every collection.
+    """RAG chain that searches every collection, with guardrails on.
 
     Not cached on purpose: building it is cheap (the slow parts, stores and LLM,
     are cached above), and caching it would keep running stale chain code after
     you edit rag_chain.py.
     """
-    return build_rag_chain(list(load_stores().values()), llm=load_llm())
+    return build_rag_chain(
+        list(load_stores().values()),
+        llm=load_llm(),
+        guard=AbhiMilkGuardrails(),  # NEW
+    )
 
 
 # --- Helpers --------------------------------------------------------------
@@ -49,9 +54,9 @@ def build_history(messages: list[dict]) -> list[BaseMessage]:
     ]
 
 
-def make_rerank_figure(rerank: RerankResult):
+def make_rerank_figure(rerank: RerankResult | None):
     """Bar plot of each retrieved chunk's relevance probability (None if not reranked)."""
-    if rerank.answer is None:
+    if rerank is None or rerank.answer is None:  # CHANGED: rerank is None when input is blocked
         return None
     labels = {
         i: f"Chunk {i + 1}\n{doc.metadata.get('doc_type', '')}"
@@ -64,15 +69,32 @@ def make_rerank_figure(rerank: RerankResult):
     return fig
 
 
+def make_guardrail_figures(guardrails: dict) -> dict:  # NEW
+    """One bar plot per guardrail stage: {"input": fig, "output": fig}."""
+    figs = plot_guardrail_stages(guardrails)
+    for fig in figs.values():
+        plt.close(fig)
+    return figs
+
+
 # --- UI components --------------------------------------------------------
-def render_context(docs: list[Document], fig=None) -> None:
-    """Show the rerank plot and the chunks used as context in a collapsible section."""
-    with st.expander(f"Retrieved context ({len(docs)} chunks)"):
+def render_context(docs: list[Document], fig=None, guard_figs: dict | None = None) -> None:
+    """Show the rerank plot, guardrail plots and the chunks used as context."""
+    label = f"Retrieved context ({len(docs)} chunks)" if docs else "Guardrail checks"
+    with st.expander(label):
         if fig is not None:
             st.pyplot(fig)
             st.caption(
                 "Chunk numbers refer to retrieval order; the top chunks by relevance are used."
             )
+        for guard_fig in (guard_figs or {}).values():  # NEW
+            st.pyplot(guard_fig)
+        if guard_figs:
+            st.caption(
+                "Guardrail scores from the classifier. Dashed line = threshold; "
+                "pink = violation; blue = informational."
+            )
+        if (fig is not None or guard_figs) and docs:
             st.divider()
         for i, doc in enumerate(docs, start=1):
             source = Path(doc.metadata.get("source", "unknown")).name
@@ -98,8 +120,8 @@ def render_message(message: dict) -> None:
         if message.get("searched_as"):
             st.caption(f"Searched for: *{message['searched_as']}*")
         st.markdown(message["content"])
-        if message.get("docs"):
-            render_context(message["docs"], message.get("fig"))
+        if message.get("docs") or message.get("guard_figs"):  # CHANGED
+            render_context(message.get("docs") or [], message.get("fig"), message.get("guard_figs"))
 
 
 def render_sidebar() -> None:
@@ -153,6 +175,7 @@ def main() -> None:
         "content": answer,
         "docs": result["docs"],
         "fig": make_rerank_figure(result["rerank"]),
+        "guard_figs": make_guardrail_figures(result.get("guardrails", {})),  # NEW
         "searched_as": searched_as,
     }
 

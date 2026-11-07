@@ -1,17 +1,3 @@
-from __future__ import annotations
-# input guardrails
-'''
-1. user should only ask about abhi milk dairy questions, no general questions
-2. user should not ask to impose as someone else, or give the llm instructions to do so. user should only ask information about abhi milk dairy products, delivery and policies.
-3. reject off-topic or malicious inputs.
-4. Retrieval Guardrails: Restrict which database records, APIs, or documents a retrieval-augmented generation (RAG) pipeline can access.
-'''
-# output guardrails
-'''
-1. No pii information leakage for generic questions.
-only if user asks contact details out of geniune concern gieve the contact details that are present in the docs
-2. Inspect generated responses to redact sensitive info, catch hallucinations, and enforce brand or legal guidelines
-'''
 """
 Guardrails for the Abhi Milk Dairy RAG chatbot (Noul / TypeSafeClassifier format).
 
@@ -24,7 +10,7 @@ Convention used for every Noul question below:
 (The only exception is `contact_request`, which is informational.)
 """
 
-
+from __future__ import annotations
 
 import re
 from pathlib import Path
@@ -148,6 +134,15 @@ class AbhiMilkGuardrails:
             return missing
         return score >= self.thresholds.get(key, self.threshold)
 
+    def _report(self, resp: Any, questions: dict, informational: Iterable[str] = ()) -> dict:
+        """Scores + thresholds for one classifier call, ready for plotting in the UI."""
+        info = set(informational)
+        return {
+            "scores": {k: self._score(resp, k) for k in questions},
+            "thresholds": {k: self.thresholds.get(k, self.threshold) for k in questions},
+            "informational": [k for k in questions if k in info],
+        }
+
     @staticmethod
     def _wrap(label: str, text: str) -> str:
         """Delimit untrusted text so the classifier treats it as data, not instructions."""
@@ -226,14 +221,15 @@ class AbhiMilkGuardrails:
         }
 
         resp = self.input_classifier.invoke({"state": state, "questions": questions})
+        report = self._report(resp, questions)
         violations = [k for k in questions if self._flag(resp, k)]
 
         if violations:
             return GuardrailResult(
                 passed=False, stage="input", violations=violations,
-                message=self.refusals["input"], details={"raw": resp},
+                message=self.refusals["input"], details={"raw": resp, "report": report},
             )
-        return GuardrailResult(passed=True, stage="input", details={"raw": resp})
+        return GuardrailResult(passed=True, stage="input", details={"raw": resp, "report": report})
 
     # ----------------------------------------------------------------------- #
     # RETRIEVAL GUARDRAILS  (4)
@@ -379,6 +375,7 @@ class AbhiMilkGuardrails:
         }
 
         resp = self.output_classifier.invoke({"state": state, "questions": questions})
+        report = self._report(resp, questions, informational=("contact_request",))
 
         violations: list[str] = []
         sanitized = answer
@@ -400,12 +397,12 @@ class AbhiMilkGuardrails:
         if hard:
             return GuardrailResult(
                 passed=False, stage="output", violations=violations,
-                message=self.refusals["output"], details={"raw": resp},
+                message=self.refusals["output"], details={"raw": resp, "report": report},
             )
 
         return GuardrailResult(
             passed=True, stage="output", violations=violations,
-            sanitized_text=sanitized, details={"raw": resp},
+            sanitized_text=sanitized, details={"raw": resp, "report": report},
         )
 
     # ----------------------------------------------------------------------- #
